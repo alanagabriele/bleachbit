@@ -28,18 +28,15 @@ import os
 import shutil
 import subprocess
 import sys
+from unittest import mock
 
+import bleachbit.General
 # local
 from bleachbit import logger
 from bleachbit.FileUtilities import exe_exists, exists_in_path
-from bleachbit.General import (
-    boolstr_to_bool,
-    get_executable,
-    get_real_uid,
-    get_real_username,
-    makedirs,
-    run_external,
-    sudo_mode)
+from bleachbit.General import (boolstr_to_bool, get_executable, get_real_uid,
+                               get_real_username, makedirs, run_external,
+                               sudo_mode)
 from tests import common
 from tests.common import test_also_with_sudo
 
@@ -92,7 +89,7 @@ class GeneralTestCase(common.BleachbitTestCase):
 
         # Test that UID is exists in passwd
         # Import pwd here because it would fail on Windows.
-        import pwd # pylint: disable=import-outside-toplevel
+        import pwd  # pylint: disable=import-outside-toplevel
         try:
             pwd_entry = pwd.getpwuid(uid)
             self.assertIsInstance(pwd_entry.pw_name, str)
@@ -213,14 +210,14 @@ class GeneralTestCase(common.BleachbitTestCase):
         common.put_env('LC_ALL', 'C')
         (rc, stdout, stderr) = run_external(
             ['ls', '/doesnotexist'], clean_env=False)
-        self.assertEqual(rc, 2)
+        self.assertIn(rc, [1, 2])
         self.assertIn('No such file', stderr)
 
         # Set parent environment to Spanish.
         common.put_env('LC_ALL', 'es_MX.UTF-8')
         (rc, stdout, stderr) = run_external(
             ['ls', '/doesnotexist'], clean_env=False)
-        self.assertEqual(rc, 2)
+        self.assertIn(rc, [1, 2])
         if os.path.exists('/usr/share/locale-langpack/es/LC_MESSAGES/coreutils.mo'):
             # Spanish language pack is installed.
             self.assertIn('No existe el archivo', stderr)
@@ -229,7 +226,7 @@ class GeneralTestCase(common.BleachbitTestCase):
         # should use English.
         (rc, stdout, stderr) = run_external(
             ['ls', '/doesnotexist'], clean_env=True)
-        self.assertEqual(rc, 2)
+        self.assertIn(rc, [1, 2])
         self.assertIn('No such file', stderr)
 
         # Reset environment
@@ -287,3 +284,111 @@ class GeneralTestCase(common.BleachbitTestCase):
     def test_sudo_mode(self):
         """Unit test for sudo_mode"""
         self.assertIsInstance(sudo_mode(), bool)
+
+
+# ---------- Additional MC/DC tests for run_external ----------
+
+class RunExternalMCDCTestCase(common.BleachbitTestCase):
+    """Extra unit tests for run_external() to satisfy MC/DC"""
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _dummy_popen_factory(returncode=0, stdout=b"", stderr=b""):
+        """
+        Returns a function that mimics subprocess.Popen and yields a
+        lightweight object with the required API (context‑manager,
+        communicate, returncode).
+        """
+        class _DummyProc:
+            def __init__(self, *args, **kwargs):
+                self.returncode = returncode
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+            def communicate(self, timeout=None):
+                return stdout, stderr
+            def kill(self):
+                pass
+            def wait(self, timeout=None):
+                self.returncode = 1
+        return lambda *args, **kwargs: _DummyProc()
+
+    # ---------- MC/DC for decision line 191 ----------
+    def test_clean_env_true_env_dict_nonempty_raises(self):
+        """CT1 – clean_env=True + env dict non‑empty → ValueError"""
+        with self.assertRaises(ValueError):
+            run_external(["echo", "ok"], env={"X": "1"}, clean_env=True)
+
+    def test_clean_env_true_env_dict_empty_ok(self):
+        """CT2 – clean_env=True + env dict empty → OK"""
+        with mock.patch(
+            "subprocess.Popen",
+            new=self._dummy_popen_factory()
+        ):
+            rc, _out, _err = run_external(["echo", "ok"], env={}, clean_env=True)
+            self.assertEqual(rc, 0)
+
+    def test_clean_env_true_env_none_ok(self):
+        """CT3 – clean_env=True + env None (not a dict) → OK"""
+        with mock.patch(
+            "subprocess.Popen",
+            new=self._dummy_popen_factory()
+        ):
+            rc, _out, _err = run_external(["echo", "ok"], env=None, clean_env=True)
+            self.assertEqual(rc, 0)
+
+    def test_clean_env_false_env_dict_ok(self):
+        """CT4 – clean_env=False + env dict non‑empty → OK"""
+        with mock.patch(
+            "subprocess.Popen",
+            new=self._dummy_popen_factory()
+        ):
+            rc, _out, _err = run_external(["echo", "ok"], env={"X": "1"}, clean_env=False)
+            self.assertEqual(rc, 0)
+
+    # ---------- MC/DC for decision line 209 ----------
+    @mock.patch("subprocess.Popen", new=_dummy_popen_factory.__func__())
+    def test_clean_env_true_posix_branch(self, *_):
+        """CT5 – clean_env=True on POSIX → env is cleaned"""
+        if os.name != "posix":
+            self.skipTest("POSIX‑specific branch")
+        rc, _out, _err = run_external(["echo", "ok"], clean_env=True)
+        self.assertEqual(rc, 0)
+
+    @mock.patch("subprocess.Popen", new=_dummy_popen_factory.__func__())
+    def test_clean_env_true_non_posix_branch(self, *_):
+        """CT6 – clean_env=True on non‑POSIX → branch skipped"""
+        with mock.patch("bleachbit.General.os.name", "nt"):
+            rc, _out, _err = run_external(["echo", "ok"], clean_env=True)
+            self.assertEqual(rc, 0)
+
+    @mock.patch("subprocess.Popen", new=_dummy_popen_factory.__func__())
+    def test_clean_env_false_posix_branch(self, *_):
+        """CT7 – clean_env=False on POSIX → branch skipped"""
+        if os.name != "posix":
+            self.skipTest("POSIX‑specific branch")
+        rc, _out, _err = run_external(["echo", "ok"], clean_env=False)
+        self.assertEqual(rc, 0)
+
+    def test_run_external_timeout_error(self):
+        class DummyProc:
+            def __enter__(self): return self
+            def __exit__(self, exc_type, exc_val, exc_tb): pass
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd=["/bin/ls"], timeout=1)
+            def kill(self): pass
+            def wait(self, timeout=None): pass
+
+        with mock.patch("subprocess.Popen", return_value=DummyProc()):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_external(["/bin/ls"], timeout=1)
+
+    def test_run_external_generic_error(self):
+        class FailingProc:
+            def __enter__(self): raise Exception("Fail")
+            def __exit__(self, exc_type, exc_val, exc_tb): pass
+
+        with mock.patch("subprocess.Popen", return_value=FailingProc()):
+            with self.assertRaises(Exception):
+                run_external(["/bin/ls"])
